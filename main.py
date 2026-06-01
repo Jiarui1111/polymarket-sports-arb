@@ -34,9 +34,10 @@ from execution.order_executor import OrderExecutor
 from logging_config import setup_logging
 from models import Event, OrderBook
 from risk.risk_manager import RiskManager
+from storage.book_capture import capture_opportunity_books
 from storage.db import Database
 from strategy.multi_outcome_arbitrage import MultiOutcomeArbitrage
-from ws.orderbook_ws import OrderBookCache, start_orderbook_ws_in_thread
+from ws.orderbook_ws import OrderBookCache, TickHistory, start_orderbook_ws_in_thread
 
 logger = logging.getLogger("main")
 
@@ -49,14 +50,15 @@ class App:
         self.args = args
         self._stop = False
 
-        self.db = Database(cfg.db_path)
+        self.db = Database(cfg)
         self.gamma = GammaClient(cfg.gamma_base_url, min_liquidity=cfg.min_market_liquidity)
         self.clob = ClobMarketClient(cfg)
         self.risk = RiskManager(cfg)
         self.strategy = MultiOutcomeArbitrage(cfg)
         self.executor = OrderExecutor(cfg, self.clob, self.risk, self.db)
 
-        self.cache = OrderBookCache()
+        tick_history = TickHistory(maxlen=cfg.book_tick_depth)
+        self.cache = OrderBookCache(tick_history=tick_history)
         self.ws = start_orderbook_ws_in_thread(cfg.clob_ws_url, self.cache)
 
         self.events: List[Event] = []
@@ -104,8 +106,27 @@ class App:
                 continue
             for plan in plans:
                 found += 1
-                self.executor.handle_opportunity(plan)
+                self._hydrate_cache_for_plan(plan)
+                book_ctx = capture_opportunity_books(
+                    self.cache,
+                    self.cache.tick_history,
+                    plan,
+                    level_depth=self.cfg.book_level_depth,
+                    tick_depth=self.cfg.book_tick_depth,
+                )
+                self.executor.handle_opportunity(plan, book_ctx)
         return found
+
+    def _hydrate_cache_for_plan(self, plan) -> None:
+        """机会触发前把 REST 补齐的订单簿灌入 cache，便于落库。"""
+        for leg in plan.legs:
+            tid = leg.token_id
+            book = self.cache.get(tid)
+            if book and (time.time() - book.ts) <= _STALE_SEC:
+                continue
+            seeded = self._seeded.get(tid)
+            if seeded:
+                self.cache.update_snapshot(seeded)
 
     def _seed_stale_books(self) -> None:
         """对 WS 尚未覆盖或陈旧的 token，用 REST 批量补齐快照。"""

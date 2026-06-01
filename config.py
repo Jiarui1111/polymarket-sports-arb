@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -86,7 +87,35 @@ class Config:
     # 运行
     scan_interval_sec: float = field(default_factory=lambda: _get_float("SCAN_INTERVAL_SEC", 15.0))
     log_level: str = field(default_factory=lambda: _get("LOG_LEVEL", "INFO").upper())
-    db_path: str = field(default_factory=lambda: _get("DB_PATH", "arb.db"))
+
+    # PostgreSQL（DATABASE_URL 优先）
+    database_url: str = field(default_factory=lambda: _get("DATABASE_URL"))
+    pg_host: str = field(default_factory=lambda: _get("PG_HOST", "localhost"))
+    pg_port: int = field(default_factory=lambda: _get_int("PG_PORT", 5432))
+    pg_user: str = field(default_factory=lambda: _get("PG_USER", "postgres"))
+    pg_password: str = field(default_factory=lambda: _get("PG_PASSWORD"))
+    pg_database: str = field(default_factory=lambda: _get("PG_DATABASE", "polymarket_arb"))
+    pg_sslmode: str = field(default_factory=lambda: _get("PG_SSLMODE", "prefer"))
+
+    # 机会落库：订单簿深度与 WS tick 条数
+    book_level_depth: int = field(default_factory=lambda: _get_int("BOOK_LEVEL_DEPTH", 5))
+    book_tick_depth: int = field(default_factory=lambda: _get_int("BOOK_TICK_DEPTH", 5))
+
+    @property
+    def pg_dsn(self) -> str:
+        if self.database_url:
+            return self.database_url
+        if self.pg_host and self.pg_user and self.pg_database:
+            user = quote_plus(self.pg_user)
+            if self.pg_password:
+                auth = f"{user}:{quote_plus(self.pg_password)}"
+            else:
+                auth = user
+            return (
+                f"postgresql://{auth}@{self.pg_host}:{self.pg_port}/{self.pg_database}"
+                f"?sslmode={self.pg_sslmode}"
+            )
+        return ""
 
     @property
     def is_real(self) -> bool:
@@ -144,7 +173,14 @@ class Config:
             "fee_rate": self.fee_rate,
             "scan_interval_sec": self.scan_interval_sec,
             "log_level": self.log_level,
-            "db_path": self.db_path,
+            "pg_host": self.pg_host,
+            "pg_port": self.pg_port,
+            "pg_user": self.pg_user,
+            "pg_password": mask(self.pg_password),
+            "pg_database": self.pg_database,
+            "database_url": mask(self.database_url),
+            "book_level_depth": self.book_level_depth,
+            "book_tick_depth": self.book_tick_depth,
         }
 
 

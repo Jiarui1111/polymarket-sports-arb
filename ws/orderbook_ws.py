@@ -2,11 +2,9 @@
 
 连接 Polymarket CLOB market 频道，维护本地 orderbook 缓存：
 - 首次收到 ``book`` 全量快照覆盖本地；
-- 收到 ``price_change`` 增量更新对应价位；
+- 收到 ``price_change`` 增量更新对应价位，并写入 tick 环形缓冲；
 - 断线自动重连并重新订阅；
 - 缓存线程安全，供策略层随时读取快照。
-
-同时提供一个 user 频道（成交确认）的轻量监听器，供执行器使用。
 """
 from __future__ import annotations
 
@@ -15,7 +13,9 @@ import json
 import logging
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Optional, Tuple
 
 import websockets
 
@@ -24,16 +24,75 @@ from models import OrderBook, PriceLevel
 logger = logging.getLogger("ws.orderbook")
 
 
+@dataclass
+class BookTick:
+    """单条盘口变动（来自 WS price_change 或 book 快照的档位）。"""
+
+    token_id: str
+    side: str  # bid | ask
+    price: float
+    size: float
+    event_type: str
+    ts: float
+
+
+class TickHistory:
+    """每个 token 的 bid/ask 各保留最近 N 条 WS tick（环形队列）。"""
+
+    def __init__(self, maxlen: int = 5) -> None:
+        self.maxlen = maxlen
+        self._queues: Dict[Tuple[str, str], Deque[BookTick]] = {}
+        self._lock = threading.Lock()
+
+    def record(self, tick: BookTick) -> None:
+        key = (tick.token_id, tick.side)
+        with self._lock:
+            if key not in self._queues:
+                self._queues[key] = deque(maxlen=self.maxlen)
+            self._queues[key].append(tick)
+
+    def record_changes(self, token_id: str, changes: List[dict], event_type: str = "price_change") -> None:
+        now = time.time()
+        for ch in changes:
+            try:
+                price = float(ch.get("price"))
+                size = float(ch.get("size"))
+                side_raw = str(ch.get("side", "")).upper()
+            except (TypeError, ValueError):
+                continue
+            side = "bid" if side_raw in ("BUY", "BID") else "ask"
+            self.record(BookTick(token_id, side, price, size, event_type, now))
+
+    def record_book_top(self, token_id: str, book: OrderBook) -> None:
+        """全量 book 时记录最优买卖档，便于无 price_change 时也有 tick。"""
+        now = time.time()
+        if book.best_bid:
+            self.record(BookTick(token_id, "bid", book.best_bid.price, book.best_bid.size, "book", now))
+        if book.best_ask:
+            self.record(BookTick(token_id, "ask", book.best_ask.price, book.best_ask.size, "book", now))
+
+    def get_ticks(self, token_id: str, tick_depth: int) -> Dict[str, List[BookTick]]:
+        """返回 {bid: [...], ask: [...]} 各最多 tick_depth 条。"""
+        out: Dict[str, List[BookTick]] = {"bid": [], "ask": []}
+        with self._lock:
+            for side in ("bid", "ask"):
+                q = self._queues.get((token_id, side), deque())
+                out[side] = list(q)[-tick_depth:]
+        return out
+
+
 class OrderBookCache:
     """线程安全的订单簿缓存。"""
 
-    def __init__(self) -> None:
+    def __init__(self, tick_history: Optional[TickHistory] = None) -> None:
         self._books: Dict[str, OrderBook] = {}
         self._lock = threading.Lock()
+        self.tick_history = tick_history or TickHistory()
 
     def update_snapshot(self, book: OrderBook) -> None:
         with self._lock:
             self._books[book.token_id] = book
+        self.tick_history.record_book_top(book.token_id, book)
 
     def apply_price_change(self, token_id: str, changes: List[dict]) -> None:
         with self._lock:
@@ -53,10 +112,24 @@ class OrderBookCache:
             book.bids.sort(key=lambda x: x.price, reverse=True)
             book.asks.sort(key=lambda x: x.price)
             book.ts = time.time()
+        self.tick_history.record_changes(token_id, changes)
 
     def get(self, token_id: str) -> Optional[OrderBook]:
         with self._lock:
             return self._books.get(token_id)
+
+    def get_copy(self, token_id: str) -> Optional[OrderBook]:
+        """深拷贝订单簿，供落库时避免并发修改。"""
+        with self._lock:
+            book = self._books.get(token_id)
+            if not book:
+                return None
+            return OrderBook(
+                token_id=book.token_id,
+                bids=[PriceLevel(l.price, l.size) for l in book.bids],
+                asks=[PriceLevel(l.price, l.size) for l in book.asks],
+                ts=book.ts,
+            )
 
     def snapshot(self) -> Dict[str, OrderBook]:
         with self._lock:
@@ -93,7 +166,6 @@ class OrderbookWebSocket:
         self._resubscribe = asyncio.Event()
 
     def set_assets(self, asset_ids: List[str]) -> None:
-        """更新订阅的 token 列表（去重）。下次（重）连接时生效。"""
         with self._lock:
             self._asset_ids = list(dict.fromkeys(asset_ids))
         self._resubscribe.set()
@@ -108,7 +180,6 @@ class OrderbookWebSocket:
             await self._ws.close()
 
     async def run(self) -> None:
-        """主循环：保持连接，断线指数退避重连。"""
         backoff = 1.0
         while not self._stop.is_set():
             assets = self._current_assets()
@@ -142,7 +213,6 @@ class OrderbookWebSocket:
 
     async def _consume(self, ws) -> None:
         while not self._stop.is_set():
-            # 若订阅列表变更，重启连接以重新订阅
             if self._resubscribe.is_set():
                 logger.info("订阅列表变更，重建 WS 连接")
                 await ws.close()
@@ -150,7 +220,7 @@ class OrderbookWebSocket:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
             except asyncio.TimeoutError:
-                continue  # 靠 ping 维持，无消息也正常
+                continue
             self._handle_message(raw)
 
     def _handle_message(self, raw: str) -> None:
@@ -158,7 +228,6 @@ class OrderbookWebSocket:
             data = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             return
-        # 消息可能是单条 dict 或 list
         messages = data if isinstance(data, list) else [data]
         for msg in messages:
             if not isinstance(msg, dict):
@@ -169,7 +238,6 @@ class OrderbookWebSocket:
                     self._on_book(msg)
                 elif event_type == "price_change":
                     self._on_price_change(msg)
-                # tick_size_change / last_trade_price 暂不影响套利簿，忽略
             except Exception as exc:
                 logger.debug("处理 WS 消息异常: %s", exc)
 
@@ -191,7 +259,6 @@ class OrderbookWebSocket:
 
 
 def start_orderbook_ws_in_thread(ws_base_url: str, cache: OrderBookCache) -> "WsThreadHandle":
-    """在后台线程里跑一个独立事件循环运行 WS。返回控制句柄。"""
     handle = WsThreadHandle(ws_base_url, cache)
     handle.start()
     return handle

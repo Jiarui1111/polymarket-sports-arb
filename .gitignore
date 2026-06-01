@@ -15,6 +15,7 @@ env/
 *.db
 *.sqlite
 *.sqlite3
+# 保留 arb.db 本地遗留；生产用 PostgreSQL
 logs/
 *.log
 
