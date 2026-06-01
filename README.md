@@ -28,11 +28,15 @@
 | `storage/db.py` | 持久化 |
 | `main.py` | 入口 |
 
+## 配置
+
+- **本地**：`.env` 中 `DB_ENABLED=false`，只写 `logs/`，无需 PostgreSQL
+- **服务器**：`cp .env.production.example .env`，`DB_ENABLED=true`，填 `PG_*` 后 `python -m db.migrate`
+
 ## 运行
 
 ```bash
 pip install -r requirements.txt
-copy .env.example .env
 
 python main.py --once --tags Sports
 python main.py --tags Sports --min-edge 0.02

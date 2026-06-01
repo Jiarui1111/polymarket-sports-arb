@@ -43,6 +43,15 @@ def _get_list(key: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _get_bool(key: str, default: bool = False) -> bool:
+    raw = _get(key).lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 @dataclass
 class Config:
     # 运行模式
@@ -88,7 +97,10 @@ class Config:
     scan_interval_sec: float = field(default_factory=lambda: _get_float("SCAN_INTERVAL_SEC", 15.0))
     log_level: str = field(default_factory=lambda: _get("LOG_LEVEL", "INFO").upper())
 
-    # PostgreSQL（DATABASE_URL 优先）
+    # 数据库：本地 false 只打日志；服务器 true 写 PostgreSQL
+    db_enabled: bool = field(default_factory=lambda: _get_bool("DB_ENABLED", False))
+
+    # PostgreSQL（DATABASE_URL 优先，仅 DB_ENABLED=true 时需要）
     database_url: str = field(default_factory=lambda: _get("DATABASE_URL"))
     pg_host: str = field(default_factory=lambda: _get("PG_HOST", "localhost"))
     pg_port: int = field(default_factory=lambda: _get_int("PG_PORT", 5432))
@@ -173,6 +185,7 @@ class Config:
             "fee_rate": self.fee_rate,
             "scan_interval_sec": self.scan_interval_sec,
             "log_level": self.log_level,
+            "db_enabled": self.db_enabled,
             "pg_host": self.pg_host,
             "pg_port": self.pg_port,
             "pg_user": self.pg_user,

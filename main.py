@@ -35,7 +35,7 @@ from logging_config import setup_logging
 from models import Event, OrderBook
 from risk.risk_manager import RiskManager
 from storage.book_capture import capture_opportunity_books
-from storage.db import Database
+from storage.db import create_database
 from strategy.multi_outcome_arbitrage import MultiOutcomeArbitrage
 from ws.orderbook_ws import OrderBookCache, TickHistory, start_orderbook_ws_in_thread
 
@@ -50,7 +50,7 @@ class App:
         self.args = args
         self._stop = False
 
-        self.db = Database(cfg)
+        self.db = create_database(cfg)
         self.gamma = GammaClient(cfg.gamma_base_url, min_liquidity=cfg.min_market_liquidity)
         self.clob = ClobMarketClient(cfg)
         self.risk = RiskManager(cfg)

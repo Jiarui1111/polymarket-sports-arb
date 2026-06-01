@@ -19,6 +19,9 @@ SQL_DIR = Path(__file__).resolve().parent / "sql"
 
 def run_migrations() -> None:
     cfg = get_config()
+    if not cfg.db_enabled:
+        logger.error("DB_ENABLED=false，无需迁移。服务器请设置 DB_ENABLED=true")
+        sys.exit(1)
     if not cfg.pg_dsn:
         logger.error("未配置 PostgreSQL（PG_* 或 DATABASE_URL）")
         sys.exit(1)
