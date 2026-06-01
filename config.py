@@ -1,0 +1,159 @@
+"""集中式配置：全部从环境变量 / .env 读取。
+
+安全准则：
+- 私钥、API secret 等敏感信息只从环境变量读取，绝不硬编码。
+- 提供 ``masked()`` 用于安全打印，永远不泄露敏感值。
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()  # 自动加载当前目录下的 .env
+
+
+def _get(key: str, default: str = "") -> str:
+    return os.getenv(key, default).strip()
+
+
+def _get_float(key: str, default: float) -> float:
+    raw = _get(key)
+    try:
+        return float(raw) if raw != "" else default
+    except ValueError:
+        return default
+
+
+def _get_int(key: str, default: int) -> int:
+    raw = _get(key)
+    try:
+        return int(raw) if raw != "" else default
+    except ValueError:
+        return default
+
+
+def _get_list(key: str) -> List[str]:
+    raw = _get(key)
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+@dataclass
+class Config:
+    # 运行模式
+    trade_mode: str = field(default_factory=lambda: _get("TRADE_MODE", "dry_run").lower())
+
+    # 凭证（敏感）
+    private_key: str = field(default_factory=lambda: _get("POLY_PRIVATE_KEY"))
+    funder_address: str = field(default_factory=lambda: _get("POLY_FUNDER_ADDRESS"))
+    signature_type: int = field(default_factory=lambda: _get_int("POLY_SIGNATURE_TYPE", 0))
+    api_key: str = field(default_factory=lambda: _get("POLY_API_KEY"))
+    api_secret: str = field(default_factory=lambda: _get("POLY_API_SECRET"))
+    api_passphrase: str = field(default_factory=lambda: _get("POLY_API_PASSPHRASE"))
+
+    # 端点
+    gamma_base_url: str = field(default_factory=lambda: _get("GAMMA_BASE_URL", "https://gamma-api.polymarket.com"))
+    clob_base_url: str = field(default_factory=lambda: _get("CLOB_BASE_URL", "https://clob.polymarket.com"))
+    clob_ws_url: str = field(default_factory=lambda: _get("CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws"))
+    chain_id: int = field(default_factory=lambda: _get_int("CHAIN_ID", 137))
+
+    # 市场发现
+    market_tags: List[str] = field(default_factory=lambda: _get_list("MARKET_TAGS"))
+    max_events: int = field(default_factory=lambda: _get_int("MAX_EVENTS", 500))
+    min_market_liquidity: float = field(default_factory=lambda: _get_float("MIN_MARKET_LIQUIDITY", 500.0))
+
+    # 策略阈值
+    min_edge: float = field(default_factory=lambda: _get_float("MIN_EDGE", 0.01))
+    slippage_buffer: float = field(default_factory=lambda: _get_float("SLIPPAGE_BUFFER", 0.005))
+    default_order_size: float = field(default_factory=lambda: _get_float("DEFAULT_ORDER_SIZE", 20.0))
+
+    # 风控
+    risk_max_order_usd: float = field(default_factory=lambda: _get_float("RISK_MAX_ORDER_USD", 50.0))
+    risk_max_event_exposure_usd: float = field(default_factory=lambda: _get_float("RISK_MAX_EVENT_EXPOSURE_USD", 200.0))
+    risk_max_total_exposure_usd: float = field(default_factory=lambda: _get_float("RISK_MAX_TOTAL_EXPOSURE_USD", 1000.0))
+    risk_min_edge: float = field(default_factory=lambda: _get_float("RISK_MIN_EDGE", 0.01))
+    risk_min_liquidity: float = field(default_factory=lambda: _get_float("RISK_MIN_LIQUIDITY", 500.0))
+    risk_max_slippage: float = field(default_factory=lambda: _get_float("RISK_MAX_SLIPPAGE", 0.02))
+    order_timeout_sec: float = field(default_factory=lambda: _get_float("ORDER_TIMEOUT_SEC", 20.0))
+
+    # 成本
+    fee_rate: float = field(default_factory=lambda: _get_float("FEE_RATE", 0.0))
+
+    # 运行
+    scan_interval_sec: float = field(default_factory=lambda: _get_float("SCAN_INTERVAL_SEC", 15.0))
+    log_level: str = field(default_factory=lambda: _get("LOG_LEVEL", "INFO").upper())
+    db_path: str = field(default_factory=lambda: _get("DB_PATH", "arb.db"))
+
+    @property
+    def is_real(self) -> bool:
+        return self.trade_mode == "real"
+
+    @property
+    def has_credentials(self) -> bool:
+        return bool(self.private_key)
+
+    def validate_for_real(self) -> List[str]:
+        """返回 real 模式下缺失/不合法的配置项列表（不含敏感值）。"""
+        problems: List[str] = []
+        if not self.private_key:
+            problems.append("POLY_PRIVATE_KEY 未设置（real 模式必需）")
+        if self.private_key and not self.private_key.startswith("0x"):
+            problems.append("POLY_PRIVATE_KEY 必须以 0x 开头")
+        if self.risk_max_order_usd <= 0:
+            problems.append("RISK_MAX_ORDER_USD 必须 > 0")
+        if self.signature_type not in (0, 1, 2):
+            problems.append("POLY_SIGNATURE_TYPE 必须是 0/1/2")
+        return problems
+
+    def masked(self) -> dict:
+        """用于安全日志打印的配置快照，敏感字段全部脱敏。"""
+        def mask(v: str) -> str:
+            return "***set***" if v else "(empty)"
+
+        return {
+            "trade_mode": self.trade_mode,
+            "private_key": mask(self.private_key),
+            "funder_address": self.funder_address or "(derive)",
+            "signature_type": self.signature_type,
+            "api_key": mask(self.api_key),
+            "api_secret": mask(self.api_secret),
+            "api_passphrase": mask(self.api_passphrase),
+            "gamma_base_url": self.gamma_base_url,
+            "clob_base_url": self.clob_base_url,
+            "clob_ws_url": self.clob_ws_url,
+            "chain_id": self.chain_id,
+            "market_tags": self.market_tags,
+            "max_events": self.max_events,
+            "min_market_liquidity": self.min_market_liquidity,
+            "min_edge": self.min_edge,
+            "slippage_buffer": self.slippage_buffer,
+            "default_order_size": self.default_order_size,
+            "risk": {
+                "max_order_usd": self.risk_max_order_usd,
+                "max_event_exposure_usd": self.risk_max_event_exposure_usd,
+                "max_total_exposure_usd": self.risk_max_total_exposure_usd,
+                "min_edge": self.risk_min_edge,
+                "min_liquidity": self.risk_min_liquidity,
+                "max_slippage": self.risk_max_slippage,
+                "order_timeout_sec": self.order_timeout_sec,
+            },
+            "fee_rate": self.fee_rate,
+            "scan_interval_sec": self.scan_interval_sec,
+            "log_level": self.log_level,
+            "db_path": self.db_path,
+        }
+
+
+_config: Optional[Config] = None
+
+
+def get_config() -> Config:
+    """单例式获取配置。"""
+    global _config
+    if _config is None:
+        _config = Config()
+    return _config
