@@ -10,6 +10,7 @@ Polymarket 多 outcome 结构套利监控与执行系统。当前默认 `dry_run
 
 - 体育冠军类：NBA Champion、MLB Champion、World Cup Group Winner
 - 区间类：Tesla deliveries、Inflation bracket、IPO market cap
+- 加密价格区间类：BTC / ETH / SOL / XRP price range、above / below
 - 候选人类：Presidential nominee、Election winner
 - 排名类：AI model ranking、Top scorer nation
 - 多候选人 / 多结果 winner market
@@ -81,7 +82,7 @@ Gamma API 拉 active / open events
 ```text
 TARGET_MARKET_FILTER_ENABLED=true
 TARGET_MIN_OUTCOMES=3
-TARGET_MARKET_KEYWORDS=champion,winner,group winner,market cap,deliveries,inflation,bracket,nominee,election,ranking,top scorer,best,most,which,how many,ipo,presidential,nba,mlb,world cup,tesla,ai model
+TARGET_MARKET_KEYWORDS=champion,winner,group winner,market cap,deliveries,inflation,bracket,nominee,election,ranking,top scorer,best,most,which,how many,ipo,crypto,bitcoin,btc,ethereum,eth,solana,sol,xrp,price,range,above,below,presidential,nba,mlb,world cup,tesla,ai model
 ```
 
 调试时可用 `--all-markets` 临时关闭目标市场过滤。
