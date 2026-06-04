@@ -89,6 +89,7 @@ class Database:
 
                 if book_ctx:
                     self._save_book_context(cur, opp_id, book_ctx)
+                self._increment_daily_opportunity_stats(cur, plan)
 
             conn.commit()
         logger.info(
@@ -96,6 +97,40 @@ class Database:
             opp_id, plan.strategy, sim_profit,
         )
         return opp_id
+
+    def _increment_daily_opportunity_stats(self, cur, plan: TradePlan) -> None:
+        cur.execute(
+            """
+            INSERT INTO daily_opportunity_stats (
+                stat_date, strategy, opportunity_count, total_est_profit,
+                max_edge, first_detected_at, last_detected_at, updated_at
+            ) VALUES (
+                (to_timestamp(%s) AT TIME ZONE 'UTC')::date,
+                %s,
+                1,
+                %s,
+                %s,
+                to_timestamp(%s),
+                to_timestamp(%s),
+                NOW()
+            )
+            ON CONFLICT (stat_date, strategy) DO UPDATE SET
+                opportunity_count = daily_opportunity_stats.opportunity_count + 1,
+                total_est_profit = daily_opportunity_stats.total_est_profit + EXCLUDED.total_est_profit,
+                max_edge = GREATEST(daily_opportunity_stats.max_edge, EXCLUDED.max_edge),
+                first_detected_at = LEAST(daily_opportunity_stats.first_detected_at, EXCLUDED.first_detected_at),
+                last_detected_at = GREATEST(daily_opportunity_stats.last_detected_at, EXCLUDED.last_detected_at),
+                updated_at = NOW()
+            """,
+            (
+                plan.ts,
+                plan.strategy,
+                plan.est_profit,
+                plan.edge,
+                plan.ts,
+                plan.ts,
+            ),
+        )
 
     def _save_book_context(self, cur, opp_id: int, ctx: OpportunityBookContext) -> None:
         level_rows = []
@@ -172,6 +207,20 @@ class Database:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "SELECT * FROM opportunities ORDER BY detected_at DESC LIMIT %s",
+                    (limit,),
+                )
+                return cur.fetchall()
+
+    def daily_opportunity_stats(self, limit: int = 30) -> list:
+        with self._lock, self._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM daily_opportunity_stats
+                    ORDER BY stat_date DESC, strategy ASC
+                    LIMIT %s
+                    """,
                     (limit,),
                 )
                 return cur.fetchall()

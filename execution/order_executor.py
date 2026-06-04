@@ -1,20 +1,15 @@
-"""订单执行器。
+"""Order execution for detected arbitrage plans.
 
-两种模式：
-- dry_run（默认）：只打印交易计划并落库，绝不真实下单。
-- real：经风控批准后真实下单。
-
-执行细节（real）：
-- 每条腿用可成交限价单提交（默认 FOK，尽量原子化，减少单腿成交带来的方向暴露）。
-- 提交后轮询订单状态确认成交；超时未成交自动撤单。
-- 任一腿失败则停止后续腿，记录告警（剩余敞口需人工/后续处理），并释放风控暴露。
-- 全程不打印私钥 / 凭证。
+Dry-run mode keeps writing opportunities before simulated orders so local
+analysis remains convenient. Real mode prioritizes execution: after risk checks
+pass, orders are sent first and database writes happen after the execution
+attempt finishes.
 """
 from __future__ import annotations
 
 import logging
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from config import Config
 from data.clob_client import ClobMarketClient
@@ -36,44 +31,72 @@ class OrderExecutor:
     def handle_opportunity(
         self, plan: TradePlan, book_ctx: Optional[OpportunityBookContext] = None
     ) -> None:
-        """统一入口：打印计划 -> 落库（含订单簿）-> 按模式执行。"""
+        """Handle one opportunity from strategy output."""
         for line in plan.summary_lines():
             logger.info(line)
         self._log_opportunity_depth(plan, book_ctx)
 
+        decision = self.risk.evaluate(plan)
+        if not decision.approved:
+            logger.info("[SKIP] risk rejected: %s", "; ".join(decision.reasons))
+            if not self.cfg.is_real:
+                self._save_opportunity(plan, book_ctx)
+            return
+
+        if self.cfg.is_real:
+            if not self.clob.trade_ready:
+                logger.warning("[REAL] trading client not ready; falling back to simulation")
+                opportunity_id = self._save_opportunity(plan, book_ctx)
+                self._simulate(plan, opportunity_id)
+                return
+
+            results = self._execute_real(plan)
+            opportunity_id = self._save_opportunity(plan, book_ctx)
+            self._save_order_results("real", plan, results, opportunity_id)
+            return
+
+        opportunity_id = self._save_opportunity(plan, book_ctx)
+        self._simulate(plan, opportunity_id)
+
+    def _save_opportunity(
+        self, plan: TradePlan, book_ctx: Optional[OpportunityBookContext]
+    ) -> Optional[int]:
         opportunity_id: Optional[int] = None
         try:
             opportunity_id = self.db.save_opportunity(plan, book_ctx)
             if book_ctx and book_ctx.sim_fill_profit is not None:
                 logger.info(
-                    "  [深度模拟] 成本=%.4f 利润=%.4f 可成套=%.2f 张",
-                    book_ctx.sim_fill_cost or 0,
+                    "  [DEPTH_SIM] cost=%.4f profit=%.4f fill_size=%.2f",
+                    book_ctx.sim_fill_cost or 0.0,
                     book_ctx.sim_fill_profit,
-                    book_ctx.sim_fill_size or 0,
+                    book_ctx.sim_fill_size or 0.0,
                 )
         except Exception as exc:
-            logger.exception("机会落库失败（继续执行/风控）: %s", exc)
+            logger.exception("failed to save opportunity: %s", exc)
+        return opportunity_id
 
-        decision = self.risk.evaluate(plan)
-        if not decision.approved:
-            logger.info("[跳过] 风控未通过：%s", "; ".join(decision.reasons))
-            return
-
-        if not self.cfg.is_real:
-            self._simulate(plan, opportunity_id)
-            return
-
-        if not self.clob.trade_ready:
-            logger.warning("[real] 交易客户端未就绪，降级为模拟。请检查 .env 凭证。")
-            self._simulate(plan, opportunity_id)
-            return
-
-        self._execute_real(plan, opportunity_id)
+    def _save_order_results(
+        self,
+        mode: str,
+        plan: TradePlan,
+        results: List[Tuple[int, OrderResult]],
+        opportunity_id: Optional[int],
+    ) -> None:
+        for leg_index, result in results:
+            try:
+                self.db.save_order(mode, plan, leg_index, result, opportunity_id=opportunity_id)
+            except Exception as exc:
+                logger.exception(
+                    "failed to save order result leg=%d order_id=%s: %s",
+                    leg_index,
+                    result.order_id,
+                    exc,
+                )
 
     def _log_opportunity_depth(
         self, plan: TradePlan, book_ctx: Optional[OpportunityBookContext]
     ) -> None:
-        """本地运行时打印机会市场、计划 size 和触发瞬间盘口深度。"""
+        """Log market, plan size, and orderbook depth at trigger time."""
         logger.info(
             "[OPPORTUNITY_MARKET] strategy=%s event_id=%s market=%s legs=%d "
             "cost=%.4f payout=%.4f profit=%.4f edge=%.4f",
@@ -144,61 +167,66 @@ class OrderExecutor:
 
     # ---------------- dry-run ----------------
     def _simulate(self, plan: TradePlan, opportunity_id: Optional[int] = None) -> None:
-        logger.info("[DRY-RUN] 模拟执行 %d 条腿，不发送真实订单", len(plan.legs))
+        logger.info("[DRY-RUN] simulate %d legs; no real orders sent", len(plan.legs))
         for i, leg in enumerate(plan.legs):
             result = OrderResult(
-                success=True, order_id=f"SIM-{int(time.time()*1000)}-{i}",
-                status="simulated", filled_size=leg.size,
+                success=True,
+                order_id=f"SIM-{int(time.time() * 1000)}-{i}",
+                status="simulated",
+                filled_size=leg.size,
             )
             self.db.save_order("dry_run", plan, i, result, opportunity_id=opportunity_id)
             logger.info("  [SIM] %s %.1f @ %.4f (%s)", leg.side, leg.size, leg.price, leg.outcome)
 
     # ---------------- real ----------------
-    def _execute_real(self, plan: TradePlan, opportunity_id: Optional[int] = None) -> None:
-        logger.warning("[REAL] 开始真实下单：%s / %s", plan.strategy, plan.event_title)
+    def _execute_real(self, plan: TradePlan) -> List[Tuple[int, OrderResult]]:
+        logger.warning("[REAL] sending orders now: %s / %s", plan.strategy, plan.event_title)
         self.risk.register(plan)
-        placed: List[tuple[int, OrderResult]] = []
+        placed: List[Tuple[int, OrderResult]] = []
         all_ok = True
 
         try:
             for i, leg in enumerate(plan.legs):
                 result = self.clob.place_limit_order(
-                    token_id=leg.token_id, side=leg.side,
-                    price=leg.price, size=leg.size, order_type="FOK",
+                    token_id=leg.token_id,
+                    side=leg.side,
+                    price=leg.price,
+                    size=leg.size,
+                    order_type="FOK",
                 )
-                self.db.save_order("real", plan, i, result, opportunity_id=opportunity_id)
                 placed.append((i, result))
 
                 if not result.success:
-                    logger.error("  腿 %d 下单失败：%s，终止后续腿", i, result.error)
+                    logger.error("  leg %d order failed: %s; stopping", i, result.error)
                     all_ok = False
                     break
 
                 confirmed = self._confirm_fill(result)
                 if not confirmed:
                     all_ok = False
-                    logger.error("  腿 %d 未在 %ss 内成交，已撤单，终止", i, self.cfg.order_timeout_sec)
+                    logger.error(
+                        "  leg %d not filled within %.1fs; order cancelled; stopping",
+                        i,
+                        self.cfg.order_timeout_sec,
+                    )
                     break
-                logger.info("  腿 %d 成交确认：%s", i, result.order_id)
+                logger.info("  leg %d fill confirmed: %s", i, result.order_id)
 
         except Exception as exc:
             all_ok = False
-            logger.exception("真实下单过程中异常：%s", exc)
+            logger.exception("real execution failed: %s", exc)
         finally:
             if not all_ok:
                 self.risk.release(plan)
                 logger.warning(
-                    "[REAL] 套利未完整成交，已释放风控暴露。请人工检查是否有单腿敞口需平仓！"
+                    "[REAL] plan did not fully fill; exposure released. Check any partial leg manually."
                 )
             else:
-                logger.warning("[REAL] 套利各腿已成交：%s", plan.event_title)
+                logger.warning("[REAL] all legs filled: %s", plan.event_title)
+        return placed
 
     def _confirm_fill(self, result: OrderResult) -> bool:
-        """确认订单成交。FOK 通常立即终态；否则轮询，超时撤单。
-
-        生产环境可改为监听 user WebSocket；此处用 REST 轮询保证可靠性。
-        """
-        # FOK：若响应已是终态成交，直接通过
+        """Confirm fill status. REST here is for order status, not market data."""
         status = (result.status or "").lower()
         if status in ("matched", "filled") or result.filled_size > 0:
             return True
@@ -217,7 +245,6 @@ class OrderExecutor:
                     return False
             time.sleep(1.0)
 
-        # 超时：撤单
         self.clob.cancel_order(result.order_id)
         return False
 

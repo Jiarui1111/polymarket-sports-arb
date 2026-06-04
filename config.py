@@ -13,7 +13,13 @@ from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
-load_dotenv()  # 自动加载当前目录下的 .env
+try:
+    load_dotenv(encoding="utf-8")
+except UnicodeDecodeError:
+    try:
+        load_dotenv(encoding="cp936")
+    except UnicodeDecodeError:
+        load_dotenv(encoding="latin-1")
 
 
 def _get(key: str, default: str = "") -> str:

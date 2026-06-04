@@ -1,19 +1,20 @@
-# 数据库迁移
+# Database Migrations
 
-按文件名顺序执行本目录下所有 `.sql`：
+Run every `.sql` file in this directory in filename order:
 
 ```bash
 pip install psycopg2-binary
-# 配置 .env 中 PG_* 或 DATABASE_URL
 python -m db.migrate
 ```
 
-## 表说明
+## Tables
 
-| 文件 | 表 | 说明 |
-|------|-----|------|
-| `001_opportunities.sql` | opportunities | 套利机会主表，含深度模拟利润 |
-| `002_opportunity_legs.sql` | opportunity_legs | 每条腿 |
-| `003_opportunity_book_levels.sql` | opportunity_book_levels | 发现时 bid/ask 各 N 档 |
-| `004_opportunity_book_ticks.sql` | opportunity_book_ticks | WS 最近 N 条 tick |
-| `005_orders.sql` | orders | 下单记录 |
+| File | Table | Purpose |
+|------|-------|---------|
+| `001_opportunities.sql` | `opportunities` | One row per detected opportunity, including estimated and simulated profit |
+| `002_opportunity_legs.sql` | `opportunity_legs` | Legs for each opportunity |
+| `003_opportunity_book_levels.sql` | `opportunity_book_levels` | Bid/ask depth captured at opportunity time |
+| `004_opportunity_book_ticks.sql` | `opportunity_book_ticks` | Recent WS ticks at opportunity time |
+| `005_orders.sql` | `orders` | Dry-run or real order records |
+| `006_widen_book_level_rank.sql` | constraint update | Widens stored depth rank range |
+| `007_daily_opportunity_stats.sql` | `daily_opportunity_stats` | Daily opportunity count and summary stats by strategy |

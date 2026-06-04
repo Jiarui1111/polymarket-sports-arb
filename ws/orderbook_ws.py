@@ -87,15 +87,19 @@ class OrderBookCache:
     def __init__(self, tick_history: Optional[TickHistory] = None) -> None:
         self._books: Dict[str, OrderBook] = {}
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._version = 0
         self.tick_history = tick_history or TickHistory()
 
     def update_snapshot(self, book: OrderBook) -> None:
-        with self._lock:
+        with self._cond:
             self._books[book.token_id] = book
+            self._version += 1
+            self._cond.notify_all()
         self.tick_history.record_book_top(book.token_id, book)
 
     def apply_price_change(self, token_id: str, changes: List[dict]) -> None:
-        with self._lock:
+        with self._cond:
             book = self._books.get(token_id)
             if book is None:
                 book = OrderBook(token_id=token_id)
@@ -112,6 +116,8 @@ class OrderBookCache:
             book.bids.sort(key=lambda x: x.price, reverse=True)
             book.asks.sort(key=lambda x: x.price)
             book.ts = time.time()
+            self._version += 1
+            self._cond.notify_all()
         self.tick_history.record_changes(token_id, changes)
 
     def get(self, token_id: str) -> Optional[OrderBook]:
@@ -139,6 +145,21 @@ class OrderBookCache:
         with self._lock:
             book = self._books.get(token_id)
             return time.time() - book.ts if book else None
+
+    def version(self) -> int:
+        with self._lock:
+            return self._version
+
+    def wait_for_update(self, last_version: int, timeout: float) -> int:
+        """Block until the cache changes or timeout expires, then return version."""
+        deadline = time.time() + max(0.0, timeout)
+        with self._cond:
+            while self._version <= last_version:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=remaining)
+            return self._version
 
 
 def _upsert_level(levels: List[PriceLevel], price: float, size: float) -> None:

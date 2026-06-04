@@ -38,3 +38,6 @@ class NullDatabase:
 
     def recent_opportunities(self, limit: int = 20) -> list:
         return []
+
+    def daily_opportunity_stats(self, limit: int = 30) -> list:
+        return []

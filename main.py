@@ -25,7 +25,7 @@ import logging
 import signal
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from config import get_config
 from data.clob_client import ClobMarketClient
@@ -40,9 +40,6 @@ from strategy.multi_outcome_arbitrage import MultiOutcomeArbitrage
 from ws.orderbook_ws import OrderBookCache, TickHistory, start_orderbook_ws_in_thread
 
 logger = logging.getLogger("main")
-
-_STALE_SEC = 10.0  # WS 快照超过该秒数视为陈旧，扫描前用 REST 补齐
-
 
 class App:
     def __init__(self, cfg, args) -> None:
@@ -62,7 +59,6 @@ class App:
         self.ws = start_orderbook_ws_in_thread(cfg.clob_ws_url, self.cache)
 
         self.events: List[Event] = []
-        self._seeded: Dict[str, OrderBook] = {}
 
     def request_stop(self, *_) -> None:
         logger.info("收到停止信号，正在优雅退出 …")
@@ -122,13 +118,8 @@ class App:
 
     # ---------------- 单轮扫描 ----------------
     def scan_once(self) -> int:
-        self._seed_stale_books()
-
         def get_book(token_id: str) -> Optional[OrderBook]:
-            book = self.cache.get(token_id)
-            if book and (time.time() - book.ts) <= _STALE_SEC:
-                return book
-            return self._seeded.get(token_id) or book
+            return self.cache.get(token_id)
 
         found = 0
         for event in self.events:
@@ -151,36 +142,12 @@ class App:
         return found
 
     def _hydrate_cache_for_plan(self, plan) -> None:
-        """机会触发前把 REST 补齐的订单簿灌入 cache，便于落库。"""
+        """机会触发前确认 cache 有触发时盘口；盘口来源只允许 WS。"""
         for leg in plan.legs:
             tid = leg.token_id
             book = self.cache.get(tid)
-            if book and (time.time() - book.ts) <= _STALE_SEC:
-                continue
-            seeded = self._seeded.get(tid)
-            if seeded:
-                self.cache.update_snapshot(seeded)
-
-    def _seed_stale_books(self) -> None:
-        """对 WS 尚未覆盖或陈旧的 token，用 REST 批量补齐快照。"""
-        needed: List[str] = []
-        for token_id in self._all_tokens():
-            book = self.cache.get(token_id)
-            if not book or (time.time() - book.ts) > _STALE_SEC:
-                needed.append(token_id)
-        if not needed:
-            self._seeded = {}
-            return
-        # CLOB batch endpoint can handle batches; split locally so the first
-        # scan has complete depth for all target tokens instead of only the
-        # first few hundred.
-        batch_size = 300
-        self._seeded = {}
-        logger.info("WS 未覆盖/已过期 %d 个 token，REST 分批补齐", len(needed))
-        for start in range(0, len(needed), batch_size):
-            batch = needed[start:start + batch_size]
-            self._seeded.update(self.clob.get_order_books(batch))
-        logger.info("REST 已补齐 %d/%d 个 token 订单簿", len(self._seeded), len(needed))
+            if not book:
+                logger.debug("机会腿缺少 WS 盘口，token=%s", tid)
 
     # ---------------- 主循环 ----------------
     def run(self) -> None:
@@ -210,9 +177,22 @@ class App:
                 except Exception as exc:
                     logger.error("重新发现市场失败：%s", exc)
 
-            self._sleep(self.cfg.scan_interval_sec)
+            observed_version = self.cache.version()
+            next_version = self._wait_for_book_update(observed_version, self.cfg.scan_interval_sec)
+            if next_version > observed_version:
+                logger.debug("WS 盘口更新触发下一轮扫描 version=%d", next_version)
 
         self.shutdown()
+
+    def _wait_for_book_update(self, observed_version: int, timeout: float) -> int:
+        deadline = time.time() + max(0.0, timeout)
+        current = observed_version
+        while not self._stop and time.time() < deadline:
+            remaining = min(1.0, max(0.0, deadline - time.time()))
+            current = self.cache.wait_for_update(observed_version, remaining)
+            if current > observed_version:
+                return current
+        return current
 
     def _sleep(self, seconds: float) -> None:
         end = time.time() + seconds
