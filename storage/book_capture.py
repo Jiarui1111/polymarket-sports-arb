@@ -81,7 +81,13 @@ def capture_opportunity_books(
                 )
         ctx.tokens[token_id] = cap
 
-    if target_size > 0:
+    if plan.strategy == "unequal_no_basket":
+        cost, payout, shares = _simulate_planned_legs(plan, ctx)
+        ctx.sim_fill_cost = cost
+        ctx.sim_fill_size = shares
+        if cost is not None and payout is not None:
+            ctx.sim_fill_profit = payout - cost
+    elif target_size > 0:
         ctx.sim_fill_cost, ctx.sim_fill_size = _simulate_buy_all_legs(plan, ctx, target_size)
         if ctx.sim_fill_cost is not None and ctx.sim_fill_size and ctx.sim_fill_size > 0:
             payout = _payout_for_plan(plan, ctx.sim_fill_size)
@@ -125,6 +131,33 @@ def _simulate_buy_all_legs(
     return total_cost, min_filled
 
 
+def _simulate_planned_legs(
+    plan: TradePlan, ctx: OpportunityBookContext
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """按每条腿自己的计划 size 复算成本，并计算 unequal NO basket worst payout。"""
+    total_cost = 0.0
+    sizes: List[float] = []
+    for leg in plan.legs:
+        cap = ctx.tokens.get(leg.token_id)
+        if not cap or leg.size <= 0:
+            return None, None, None
+        fill = _levels_to_book(cap).cost_to_buy(leg.size)
+        if not fill:
+            return None, None, None
+        avg, filled = fill
+        if filled + 1e-9 < leg.size:
+            return None, None, None
+        total_cost += avg * leg.size
+        sizes.append(leg.size)
+
+    total_shares = sum(sizes)
+    if plan.strategy == "unequal_no_basket":
+        payout = total_shares - max(sizes) if sizes else 0.0
+    else:
+        payout = plan.est_max_payout
+    return total_cost, payout, total_shares
+
+
 def _payout_for_plan(plan: TradePlan, size: float) -> float:
     if plan.strategy == "complement":
         return size * 1.0
@@ -133,6 +166,9 @@ def _payout_for_plan(plan: TradePlan, size: float) -> float:
     if plan.strategy == "sell_set":
         n = len(plan.legs)
         return size * float(max(0, n - 1))
+    if plan.strategy == "unequal_no_basket":
+        sizes = [leg.size for leg in plan.legs]
+        return sum(sizes) - max(sizes) if sizes else 0.0
     return plan.est_max_payout
 
 

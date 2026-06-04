@@ -71,14 +71,47 @@ class App:
     # ---------------- 市场发现 ----------------
     def discover(self) -> None:
         tags = self.args.tags if self.args.tags else self.cfg.market_tags
-        self.events = self.gamma.fetch_events(max_events=self.cfg.max_events, tags=tags or None)
+        discovered = self.gamma.fetch_events(max_events=self.cfg.max_events, tags=tags or None)
+        self.events = self._filter_target_events(discovered)
 
         multi = sum(1 for e in self.events if e.neg_risk and len(e.markets) >= 2)
-        logger.info("发现事件 %d 个，其中 neg-risk 多结果 %d 个", len(self.events), multi)
+        logger.info(
+            "发现事件 %d 个，目标过滤后 %d 个，其中 neg-risk 多结果 %d 个",
+            len(discovered),
+            len(self.events),
+            multi,
+        )
 
         token_ids = self._all_tokens()
         self.ws.set_assets(token_ids)
         logger.info("已向 WS 订阅 %d 个 token 的实时订单簿", len(token_ids))
+
+    def _filter_target_events(self, events: List[Event]) -> List[Event]:
+        if self.args.all_markets or not self.cfg.target_market_filter_enabled:
+            return events
+
+        keywords = [kw.strip().lower() for kw in self.cfg.target_market_keywords if kw.strip()]
+        out: List[Event] = []
+        rejected_not_multi = 0
+        rejected_keyword = 0
+        for event in events:
+            if not event.neg_risk or len(event.markets) < self.cfg.target_min_outcomes:
+                rejected_not_multi += 1
+                continue
+            haystack = _event_search_text(event)
+            if keywords and not any(kw in haystack for kw in keywords):
+                rejected_keyword += 1
+                continue
+            out.append(event)
+
+        logger.info(
+            "目标市场过滤：保留 %d/%d 个，剔除非互斥多结果 %d 个，关键词未命中 %d 个",
+            len(out),
+            len(events),
+            rejected_not_multi,
+            rejected_keyword,
+        )
+        return out
 
     def _all_tokens(self) -> List[str]:
         tokens: List[str] = []
@@ -138,10 +171,16 @@ class App:
         if not needed:
             self._seeded = {}
             return
-        # 控制单次 REST 数量，避免限速
-        batch = needed[:300]
-        logger.info("WS 未覆盖 %d 个 token，REST 补齐 %d 个", len(needed), len(batch))
-        self._seeded = self.clob.get_order_books(batch)
+        # CLOB batch endpoint can handle batches; split locally so the first
+        # scan has complete depth for all target tokens instead of only the
+        # first few hundred.
+        batch_size = 300
+        self._seeded = {}
+        logger.info("WS 未覆盖/已过期 %d 个 token，REST 分批补齐", len(needed))
+        for start in range(0, len(needed), batch_size):
+            batch = needed[start:start + batch_size]
+            self._seeded.update(self.clob.get_order_books(batch))
+        logger.info("REST 已补齐 %d/%d 个 token 订单簿", len(self._seeded), len(needed))
 
     # ---------------- 主循环 ----------------
     def run(self) -> None:
@@ -208,6 +247,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-events", type=int, help="最大拉取事件数，覆盖配置")
     p.add_argument("--tags", nargs="*", help="标签过滤，如 --tags Sports")
     p.add_argument("--min-edge", type=float, help="最小净 edge 阈值，覆盖配置")
+    p.add_argument("--all-markets", action="store_true", help="关闭目标市场关键词过滤，扫描拉到的全部市场")
     p.add_argument("--i-understand-real", action="store_true",
                    help="real 模式安全确认开关（缺失则强制回退 dry-run）")
     return p.parse_args(argv)
@@ -257,6 +297,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         app.request_stop()
         app.shutdown()
     return 0
+
+
+def _event_search_text(event: Event) -> str:
+    parts = [event.title, event.slug, " ".join(event.tags)]
+    for market in event.markets:
+        parts.extend([market.question, market.slug, market.group_item_title])
+    return " ".join(p for p in parts if p).lower()
 
 
 if __name__ == "__main__":

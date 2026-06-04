@@ -43,6 +43,11 @@ def _get_list(key: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _get_list_default(key: str, default: List[str]) -> List[str]:
+    values = _get_list(key)
+    return values if values else list(default)
+
+
 def _get_bool(key: str, default: bool = False) -> bool:
     raw = _get(key).lower()
     if raw in ("1", "true", "yes", "on"):
@@ -75,11 +80,41 @@ class Config:
     market_tags: List[str] = field(default_factory=lambda: _get_list("MARKET_TAGS"))
     max_events: int = field(default_factory=lambda: _get_int("MAX_EVENTS", 500))
     min_market_liquidity: float = field(default_factory=lambda: _get_float("MIN_MARKET_LIQUIDITY", 500.0))
+    target_market_filter_enabled: bool = field(default_factory=lambda: _get_bool("TARGET_MARKET_FILTER_ENABLED", True))
+    target_min_outcomes: int = field(default_factory=lambda: _get_int("TARGET_MIN_OUTCOMES", 3))
+    target_market_keywords: List[str] = field(default_factory=lambda: _get_list_default("TARGET_MARKET_KEYWORDS", [
+        "champion",
+        "winner",
+        "group winner",
+        "market cap",
+        "deliveries",
+        "inflation",
+        "bracket",
+        "nominee",
+        "election",
+        "ranking",
+        "top scorer",
+        "best",
+        "most",
+        "which",
+        "how many",
+        "ipo",
+        "presidential",
+        "nba",
+        "mlb",
+        "world cup",
+        "tesla",
+        "ai model",
+    ]))
 
     # 策略阈值
     min_edge: float = field(default_factory=lambda: _get_float("MIN_EDGE", 0.01))
     slippage_buffer: float = field(default_factory=lambda: _get_float("SLIPPAGE_BUFFER", 0.005))
     default_order_size: float = field(default_factory=lambda: _get_float("DEFAULT_ORDER_SIZE", 20.0))
+    enable_complement_strategy: bool = field(default_factory=lambda: _get_bool("ENABLE_COMPLEMENT_STRATEGY", False))
+    enable_yes_complete_set: bool = field(default_factory=lambda: _get_bool("ENABLE_YES_COMPLETE_SET", True))
+    enable_equal_no_basket: bool = field(default_factory=lambda: _get_bool("ENABLE_EQUAL_NO_BASKET", True))
+    enable_unequal_no_basket: bool = field(default_factory=lambda: _get_bool("ENABLE_UNEQUAL_NO_BASKET", True))
 
     # 风控
     risk_max_order_usd: float = field(default_factory=lambda: _get_float("RISK_MAX_ORDER_USD", 50.0))
@@ -170,9 +205,18 @@ class Config:
             "market_tags": self.market_tags,
             "max_events": self.max_events,
             "min_market_liquidity": self.min_market_liquidity,
+            "target_market_filter_enabled": self.target_market_filter_enabled,
+            "target_min_outcomes": self.target_min_outcomes,
+            "target_market_keywords": self.target_market_keywords,
             "min_edge": self.min_edge,
             "slippage_buffer": self.slippage_buffer,
             "default_order_size": self.default_order_size,
+            "strategies": {
+                "complement": self.enable_complement_strategy,
+                "yes_complete_set": self.enable_yes_complete_set,
+                "equal_no_basket": self.enable_equal_no_basket,
+                "unequal_no_basket": self.enable_unequal_no_basket,
+            },
             "risk": {
                 "max_order_usd": self.risk_max_order_usd,
                 "max_event_exposure_usd": self.risk_max_event_exposure_usd,

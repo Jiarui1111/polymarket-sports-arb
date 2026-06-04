@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from config import Config
@@ -31,6 +32,14 @@ logger = logging.getLogger("strategy.arb")
 BookGetter = Callable[[str], Optional[OrderBook]]
 
 
+@dataclass
+class _NoLevelVar:
+    market: Market
+    token_id: str
+    price: float
+    size: float
+
+
 class MultiOutcomeArbitrage:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -38,20 +47,27 @@ class MultiOutcomeArbitrage:
     def scan_event(self, event: Event, get_book: BookGetter) -> List[TradePlan]:
         plans: List[TradePlan] = []
 
-        # 策略 1：每个市场内部的补集套利
-        for market in event.markets:
-            plan = self._complement(event, market, get_book)
-            if plan:
-                plans.append(plan)
+        # Optional legacy strategy: a single binary market YES+NO complement.
+        if self.cfg.enable_complement_strategy:
+            for market in event.markets:
+                plan = self._complement(event, market, get_book)
+                if plan:
+                    plans.append(plan)
 
         # 策略 2 & 3：仅对 neg-risk（互斥多结果）事件
         if event.neg_risk and len(event.markets) >= 2:
-            buy_set = self._buy_yes_set(event, get_book)
-            if buy_set:
-                plans.append(buy_set)
-            sell_set = self._buy_no_set(event, get_book)
-            if sell_set:
-                plans.append(sell_set)
+            if self.cfg.enable_yes_complete_set:
+                buy_set = self._buy_yes_set(event, get_book)
+                if buy_set:
+                    plans.append(buy_set)
+            if self.cfg.enable_equal_no_basket:
+                sell_set = self._buy_no_set(event, get_book)
+                if sell_set:
+                    plans.append(sell_set)
+            if self.cfg.enable_unequal_no_basket:
+                unequal_no = self._unequal_no_basket(event, get_book)
+                if unequal_no:
+                    plans.append(unequal_no)
 
         return plans
 
@@ -186,6 +202,158 @@ class MultiOutcomeArbitrage:
             slippage=slippage,
             depths=depths,
             notes=f"互斥 {n} 结果 YES 总和>1，买完整 NO 集，payout={n-1}",
+        )
+        return plan if self._passes(plan) else None
+
+    # ---------------- 策略 3b：不等额 NO Basket ----------------
+    def _unequal_no_basket(self, event: Event, get_book: BookGetter) -> Optional[TradePlan]:
+        """线性规划寻找不等额 NO basket。
+
+        PDF 里的公式是：
+            profit = (sum(q_i) - max(q_i)) - sum(cost_i)
+
+        这里把每个 NO ask 档位作为一个可买变量，并增加 W 变量表示
+        worst_payout。约束 W <= sum(q_j for j != i)，目标最大化
+        W - total_cost。每个 outcome 的最大买入份额用 DEFAULT_ORDER_SIZE
+        截断，避免优化器在深盘口上给出超出当前试运行规模的组合。
+        """
+        try:
+            from scipy.optimize import linprog
+        except Exception:
+            logger.debug("scipy 未安装，跳过 unequal_no_basket")
+            return None
+
+        if len(event.markets) < 3:
+            return None
+
+        max_per_outcome = max(0.0, self.cfg.default_order_size)
+        if max_per_outcome <= 0:
+            return None
+
+        vars_: List[_NoLevelVar] = []
+        outcome_var_indexes: List[List[int]] = []
+        top_prices: Dict[str, float] = {}
+
+        for market in event.markets:
+            token_id = market.no_token_id
+            book = get_book(token_id) if token_id else None
+            if not token_id or not book or not book.best_ask:
+                return None
+
+            top_prices[token_id] = book.best_ask.price
+            indexes: List[int] = []
+            remaining_cap = max_per_outcome
+            for level in sorted(book.asks, key=lambda lvl: lvl.price):
+                if remaining_cap <= 1e-9:
+                    break
+                size = min(level.size, remaining_cap)
+                if size <= 1e-9:
+                    continue
+                indexes.append(len(vars_))
+                vars_.append(_NoLevelVar(market, token_id, level.price, size))
+                remaining_cap -= size
+            if not indexes:
+                return None
+            outcome_var_indexes.append(indexes)
+
+        var_count = len(vars_)
+        w_index = var_count
+
+        # linprog does minimization, so minimize total_cost - W.
+        objective = [v.price for v in vars_] + [-1.0]
+        bounds = [(0.0, v.size) for v in vars_] + [(0.0, None)]
+
+        constraints = []
+        rhs = []
+        for indexes in outcome_var_indexes:
+            row = [0.0] * (var_count + 1)
+            excluded = set(indexes)
+            for j in range(var_count):
+                if j not in excluded:
+                    row[j] = -1.0
+            row[w_index] = 1.0
+            constraints.append(row)
+            rhs.append(0.0)
+
+        result = linprog(
+            c=objective,
+            A_ub=constraints,
+            b_ub=rhs,
+            bounds=bounds,
+            method="highs",
+        )
+        if not result.success:
+            logger.debug(
+                "unequal_no_basket optimizer failed event=%s: %s",
+                event.event_id,
+                result.message,
+            )
+            return None
+
+        quantities = [max(0.0, float(x)) for x in result.x[:var_count]]
+        worst_payout = max(0.0, float(result.x[w_index]))
+
+        by_token: Dict[str, dict] = {}
+        for qty, var in zip(quantities, vars_):
+            if qty <= 1e-6:
+                continue
+            row = by_token.setdefault(
+                var.token_id,
+                {"market": var.market, "qty": 0.0, "cost": 0.0, "top_cost": 0.0},
+            )
+            row["qty"] += qty
+            row["cost"] += qty * var.price
+            row["top_cost"] += qty * top_prices[var.token_id]
+
+        if len(by_token) < 2:
+            return None
+
+        total_cost = sum(row["cost"] for row in by_token.values())
+        fee_cost = self.cfg.fee_rate * total_cost
+        profit = worst_payout - total_cost - fee_cost
+        if total_cost <= 0 or worst_payout <= 0 or profit <= 0:
+            return None
+
+        roi = profit / total_cost
+        total_shares = sum(row["qty"] for row in by_token.values())
+        top_cost = sum(row["top_cost"] for row in by_token.values())
+        slippage = max(0.0, (total_cost - top_cost) / total_shares) if total_shares > 0 else 0.0
+
+        legs: List[TradeLeg] = []
+        depths: List[float] = []
+        for token_id, row in by_token.items():
+            market = row["market"]
+            qty = row["qty"]
+            avg_price = row["cost"] / qty
+            depths.append(qty)
+            legs.append(TradeLeg(
+                event_id=event.event_id,
+                market_id=market.market_id,
+                market_question=market.question,
+                token_id=token_id,
+                outcome=f"No:{market.group_item_title or market.question[:16]}",
+                side="BUY",
+                price=round(avg_price, 4),
+                size=round(qty, 2),
+                available_depth=round(qty, 2),
+            ))
+
+        plan = TradePlan(
+            strategy="unequal_no_basket",
+            event_id=event.event_id,
+            event_title=event.title,
+            legs=legs,
+            est_cost=round(total_cost, 4),
+            est_max_payout=round(worst_payout, 4),
+            est_profit=round(profit, 4),
+            edge=round(roi - self.cfg.slippage_buffer, 4),
+            slippage=round(slippage, 4),
+            fee_cost=round(fee_cost, 4),
+            min_depth=round(min(depths), 2) if depths else 0.0,
+            notes=(
+                f"Unequal NO basket: worst_payout={worst_payout:.4f}, "
+                f"cost={total_cost:.4f}, profit={profit:.4f}, roi={roi*100:.3f}%"
+            ),
         )
         return plan if self._passes(plan) else None
 

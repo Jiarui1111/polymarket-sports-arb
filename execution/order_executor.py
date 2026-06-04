@@ -39,6 +39,7 @@ class OrderExecutor:
         """统一入口：打印计划 -> 落库（含订单簿）-> 按模式执行。"""
         for line in plan.summary_lines():
             logger.info(line)
+        self._log_opportunity_depth(plan, book_ctx)
 
         opportunity_id: Optional[int] = None
         try:
@@ -68,6 +69,78 @@ class OrderExecutor:
             return
 
         self._execute_real(plan, opportunity_id)
+
+    def _log_opportunity_depth(
+        self, plan: TradePlan, book_ctx: Optional[OpportunityBookContext]
+    ) -> None:
+        """本地运行时打印机会市场、计划 size 和触发瞬间盘口深度。"""
+        logger.info(
+            "[OPPORTUNITY_MARKET] strategy=%s event_id=%s market=%s legs=%d "
+            "cost=%.4f payout=%.4f profit=%.4f edge=%.4f",
+            plan.strategy,
+            plan.event_id,
+            plan.event_title,
+            len(plan.legs),
+            plan.est_cost,
+            plan.est_max_payout,
+            plan.est_profit,
+            plan.edge,
+        )
+        if not book_ctx:
+            logger.info("[OPPORTUNITY_DEPTH] no book context captured")
+            return
+
+        if book_ctx.sim_fill_profit is not None:
+            logger.info(
+                "[OPPORTUNITY_DEPTH] simulated_cost=%.4f simulated_profit=%.4f "
+                "simulated_size=%.2f",
+                book_ctx.sim_fill_cost or 0.0,
+                book_ctx.sim_fill_profit,
+                book_ctx.sim_fill_size or 0.0,
+            )
+
+        level_limit = max(1, self.cfg.book_level_depth)
+        for i, leg in enumerate(plan.legs):
+            cap = book_ctx.tokens.get(leg.token_id)
+            if not cap:
+                logger.info(
+                    "[OPPORTUNITY_LEG] idx=%d side=%s outcome=%s token=%s "
+                    "plan_size=%.2f plan_price=%.4f available_depth=%.2f book=missing",
+                    i,
+                    leg.side,
+                    leg.outcome,
+                    _short_token(leg.token_id),
+                    leg.size,
+                    leg.price,
+                    leg.available_depth,
+                )
+                continue
+
+            logger.info(
+                "[OPPORTUNITY_LEG] idx=%d side=%s outcome=%s token=%s "
+                "plan_size=%.2f plan_price=%.4f available_depth=%.2f "
+                "best_bid=%s best_ask=%s book_age=%.2fs",
+                i,
+                leg.side,
+                leg.outcome,
+                _short_token(leg.token_id),
+                leg.size,
+                leg.price,
+                leg.available_depth,
+                _fmt_price(cap.best_bid),
+                _fmt_price(cap.best_ask),
+                max(0.0, time.time() - cap.book_ts) if cap.book_ts else -1.0,
+            )
+            for side in ("bid", "ask"):
+                levels = [lvl for lvl in cap.levels if lvl.side == side][:level_limit]
+                formatted = ", ".join(f"{lvl.price:.4f}x{lvl.size:.2f}" for lvl in levels)
+                logger.info(
+                    "[OPPORTUNITY_BOOK] idx=%d token=%s side=%s levels=%s",
+                    i,
+                    _short_token(leg.token_id),
+                    side,
+                    formatted or "(empty)",
+                )
 
     # ---------------- dry-run ----------------
     def _simulate(self, plan: TradePlan, opportunity_id: Optional[int] = None) -> None:
@@ -147,3 +220,13 @@ class OrderExecutor:
         # 超时：撤单
         self.clob.cancel_order(result.order_id)
         return False
+
+
+def _short_token(token_id: str) -> str:
+    if len(token_id) <= 14:
+        return token_id
+    return f"{token_id[:10]}...{token_id[-4:]}"
+
+
+def _fmt_price(value: Optional[float]) -> str:
+    return "none" if value is None else f"{value:.4f}"
