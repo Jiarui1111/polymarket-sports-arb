@@ -110,7 +110,6 @@ class Config:
     # 策略阈值
     min_edge: float = field(default_factory=lambda: _get_float("MIN_EDGE", 0.01))
     slippage_buffer: float = field(default_factory=lambda: _get_float("SLIPPAGE_BUFFER", 0.005))
-    default_order_size: float = field(default_factory=lambda: _get_float("DEFAULT_ORDER_SIZE", 20.0))
     enable_complement_strategy: bool = field(default_factory=lambda: _get_bool("ENABLE_COMPLEMENT_STRATEGY", False))
     enable_yes_complete_set: bool = field(default_factory=lambda: _get_bool("ENABLE_YES_COMPLETE_SET", True))
     enable_equal_no_basket: bool = field(default_factory=lambda: _get_bool("ENABLE_EQUAL_NO_BASKET", True))
@@ -210,7 +209,6 @@ class Config:
             "target_market_keywords": self.target_market_keywords,
             "min_edge": self.min_edge,
             "slippage_buffer": self.slippage_buffer,
-            "default_order_size": self.default_order_size,
             "strategies": {
                 "complement": self.enable_complement_strategy,
                 "yes_complete_set": self.enable_yes_complete_set,

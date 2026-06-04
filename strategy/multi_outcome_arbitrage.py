@@ -80,7 +80,7 @@ class MultiOutcomeArbitrage:
         if not yes_book or not no_book:
             return None
 
-        size = self._feasible_buy_size([yes_book, no_book])
+        size = self._max_profitable_equal_buy_size([yes_book, no_book], payout_per_set=1.0)
         if size <= 0:
             return None
 
@@ -127,7 +127,7 @@ class MultiOutcomeArbitrage:
             legs_data.append((m, tid))
             books.append(book)
 
-        size = self._feasible_buy_size(books)
+        size = self._max_profitable_equal_buy_size(books, payout_per_set=1.0)
         if size <= 0:
             return None
 
@@ -171,7 +171,8 @@ class MultiOutcomeArbitrage:
             legs_data.append((m, tid))
             books.append(book)
 
-        size = self._feasible_buy_size(books)
+        payout_per_set = float(n - 1)
+        size = self._max_profitable_equal_buy_size(books, payout_per_set=payout_per_set)
         if size <= 0:
             return None
 
@@ -186,8 +187,6 @@ class MultiOutcomeArbitrage:
             avg_sum += avg
             top_sum += book.best_ask.price
         filled_size = min(depths)
-        # 买 N 个 NO，payout = N-1
-        payout_per_set = float(n - 1)
         edge_per_unit = payout_per_set - avg_sum
         slippage = max(0.0, avg_sum - top_sum)
 
@@ -214,8 +213,7 @@ class MultiOutcomeArbitrage:
 
         这里把每个 NO ask 档位作为一个可买变量，并增加 W 变量表示
         worst_payout。约束 W <= sum(q_j for j != i)，目标最大化
-        W - total_cost。每个 outcome 的最大买入份额用 DEFAULT_ORDER_SIZE
-        截断，避免优化器在深盘口上给出超出当前试运行规模的组合。
+        W - total_cost。每个 ask level 的 size 是唯一上限，不再额外截断。
         """
         try:
             from scipy.optimize import linprog
@@ -224,10 +222,6 @@ class MultiOutcomeArbitrage:
             return None
 
         if len(event.markets) < 3:
-            return None
-
-        max_per_outcome = max(0.0, self.cfg.default_order_size)
-        if max_per_outcome <= 0:
             return None
 
         vars_: List[_NoLevelVar] = []
@@ -242,16 +236,11 @@ class MultiOutcomeArbitrage:
 
             top_prices[token_id] = book.best_ask.price
             indexes: List[int] = []
-            remaining_cap = max_per_outcome
             for level in sorted(book.asks, key=lambda lvl: lvl.price):
-                if remaining_cap <= 1e-9:
-                    break
-                size = min(level.size, remaining_cap)
-                if size <= 1e-9:
+                if level.size <= 1e-9:
                     continue
                 indexes.append(len(vars_))
-                vars_.append(_NoLevelVar(market, token_id, level.price, size))
-                remaining_cap -= size
+                vars_.append(_NoLevelVar(market, token_id, level.price, level.size))
             if not indexes:
                 return None
             outcome_var_indexes.append(indexes)
@@ -358,14 +347,65 @@ class MultiOutcomeArbitrage:
         return plan if self._passes(plan) else None
 
     # ---------------- 通用辅助 ----------------
-    def _feasible_buy_size(self, books: List[OrderBook]) -> float:
-        """各腿 ask 总深度的最小值，再按配置上限截断。"""
-        target = self.cfg.default_order_size
-        min_depth = target
+    def _max_profitable_equal_buy_size(self, books: List[OrderBook], payout_per_set: float) -> float:
+        """Return the largest equal leg size that still passes strategy filters.
+
+        The only size boundary is current ask depth. We test cumulative ask
+        breakpoints from all legs so a plan can scale from 5 shares to 1000+
+        shares when the book supports it and the edge remains valid.
+        """
+        if not books or any(not book.asks for book in books):
+            return 0.0
+
+        max_depth = min(sum(level.size for level in book.asks) for book in books)
+        if max_depth <= 0:
+            return 0.0
+
+        candidates = {max_depth}
         for book in books:
-            depth = sum(l.size for l in book.asks)
-            min_depth = min(min_depth, depth)
-        return max(0.0, min(target, min_depth))
+            cumulative = 0.0
+            for level in sorted(book.asks, key=lambda lvl: lvl.price):
+                cumulative += level.size
+                if 0 < cumulative <= max_depth + 1e-9:
+                    candidates.add(min(cumulative, max_depth))
+
+        best = 0.0
+        for size in sorted(candidates):
+            stats = self._equal_buy_stats(books, size, payout_per_set)
+            if not stats:
+                continue
+            edge_per_unit, slippage, total_cost = stats
+            net_edge = edge_per_unit - self.cfg.slippage_buffer
+            fee_cost = self.cfg.fee_rate * total_cost
+            est_profit = edge_per_unit * size - fee_cost
+            if net_edge < self.cfg.min_edge:
+                continue
+            if slippage > self.cfg.risk_max_slippage:
+                continue
+            if est_profit <= 0:
+                continue
+            best = size
+        return best
+
+    def _equal_buy_stats(
+        self, books: List[OrderBook], size: float, payout_per_set: float
+    ) -> Optional[tuple[float, float, float]]:
+        avg_sum = 0.0
+        top_sum = 0.0
+        total_cost = 0.0
+        for book in books:
+            fill = book.cost_to_buy(size)
+            if not fill or not book.best_ask:
+                return None
+            avg, filled = fill
+            if filled + 1e-9 < size:
+                return None
+            avg_sum += avg
+            top_sum += book.best_ask.price
+            total_cost += avg * size
+        edge_per_unit = payout_per_set - avg_sum
+        slippage = max(0.0, avg_sum - top_sum)
+        return edge_per_unit, slippage, total_cost
 
     def _build_plan(
         self, strategy: str, event: Event, legs_spec, size: float,

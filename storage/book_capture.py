@@ -60,6 +60,7 @@ def capture_opportunity_books(
 ) -> OpportunityBookContext:
     """在机会触发瞬间复制订单簿与 tick 队列（线程安全读）。"""
     token_ids = list(dict.fromkeys(leg.token_id for leg in plan.legs))
+    required_ask_size = {leg.token_id: leg.size for leg in plan.legs}
     ctx = OpportunityBookContext(plan=plan)
     target_size = plan.legs[0].size if plan.legs else 0.0
 
@@ -72,7 +73,7 @@ def capture_opportunity_books(
                 cap.best_bid = book.best_bid.price
             if book.best_ask:
                 cap.best_ask = book.best_ask.price
-            cap.levels = _top_levels(book, level_depth)
+            cap.levels = _top_levels(book, level_depth, required_ask_size.get(token_id, 0.0))
         tick_map = tick_history.get_ticks(token_id, tick_depth)
         for side in ("bid", "ask"):
             for seq, t in enumerate(tick_map.get(side, []), start=1):
@@ -95,12 +96,16 @@ def capture_opportunity_books(
     return ctx
 
 
-def _top_levels(book: OrderBook, depth: int) -> List[BookLevelRow]:
+def _top_levels(book: OrderBook, depth: int, min_ask_size: float = 0.0) -> List[BookLevelRow]:
     rows: List[BookLevelRow] = []
     for i, lvl in enumerate(book.bids[:depth], start=1):
         rows.append(BookLevelRow(book.token_id, "bid", i, lvl.price, lvl.size))
-    for i, lvl in enumerate(book.asks[:depth], start=1):
+    ask_total = 0.0
+    for i, lvl in enumerate(book.asks, start=1):
+        if i > depth and ask_total >= min_ask_size - 1e-9:
+            break
         rows.append(BookLevelRow(book.token_id, "ask", i, lvl.price, lvl.size))
+        ask_total += lvl.size
     return rows
 
 

@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS opportunity_book_levels (
     opportunity_id  BIGINT NOT NULL REFERENCES opportunities (id) ON DELETE CASCADE,
     token_id        VARCHAR(128) NOT NULL,
     side            VARCHAR(8) NOT NULL CHECK (side IN ('bid', 'ask')),
-    level_rank      SMALLINT NOT NULL CHECK (level_rank BETWEEN 1 AND 20),
+    level_rank      SMALLINT NOT NULL CHECK (level_rank BETWEEN 1 AND 500),
     price           DOUBLE PRECISION NOT NULL,
     size            DOUBLE PRECISION NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
