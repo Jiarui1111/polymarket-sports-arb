@@ -22,6 +22,7 @@ class Market:
     slug: str = ""
     group_item_title: str = ""          # 在 event 内的短标题（如队名）
     condition_id: str = ""              # CLOB condition id
+    neg_risk_market_id: str = ""
     outcomes: List[str] = field(default_factory=list)        # ["Yes", "No"]
     clob_token_ids: List[str] = field(default_factory=list)  # 与 outcomes 对应的 token id
     outcome_prices: List[float] = field(default_factory=list)

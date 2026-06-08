@@ -77,6 +77,49 @@ class UnequalNoBasketTest(unittest.TestCase):
         self.assertAlmostEqual(plan.est_max_payout, 30.0)
         self.assertAlmostEqual(plan.est_profit, 15.0)
 
+    def test_scans_each_neg_risk_market_id_separately(self):
+        cfg = Config()
+        cfg.fee_rate = 0.0
+        cfg.min_edge = 0.001
+        cfg.risk_min_edge = 0.001
+        cfg.risk_max_slippage = 1.0
+        cfg.slippage_buffer = 0.0
+        cfg.enable_equal_no_basket = False
+        cfg.enable_unequal_no_basket = False
+
+        markets = []
+        books = {}
+        specs = [
+            ("group-a", 0.40),
+            ("group-a", 0.40),
+            ("group-b", 0.70),
+            ("group-b", 0.70),
+        ]
+        for i, (group_id, price) in enumerate(specs):
+            yes_token = f"group-yes-{i}"
+            no_token = f"group-no-{i}"
+            markets.append(
+                Market(
+                    market_id=str(i),
+                    question=f"Outcome {i}",
+                    group_item_title=f"G{i}",
+                    condition_id=f"condition-{i}",
+                    neg_risk_market_id=group_id,
+                    outcomes=["Yes", "No"],
+                    clob_token_ids=[yes_token, no_token],
+                )
+            )
+            books[yes_token] = OrderBook(yes_token, asks=[PriceLevel(price, 100.0)])
+            books[no_token] = OrderBook(no_token, asks=[PriceLevel(0.9, 100.0)])
+
+        event = Event(event_id="mixed-event", title="Mixed Event", neg_risk=True, markets=markets)
+        plans = MultiOutcomeArbitrage(cfg).scan_event(event, books.get)
+        buy_sets = [p for p in plans if p.strategy == "buy_set"]
+
+        self.assertEqual(len(buy_sets), 1)
+        self.assertEqual(len(buy_sets[0].legs), 2)
+        self.assertAlmostEqual(buy_sets[0].est_cost, 80.0)
+
 
 if __name__ == "__main__":
     unittest.main()

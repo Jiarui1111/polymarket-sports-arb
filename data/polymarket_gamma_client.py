@@ -182,8 +182,6 @@ class GammaClient:
             return None
 
         liquidity = _to_float(raw.get("liquidityNum"), _to_float(raw.get("liquidity"), 0.0)) or 0.0
-        if liquidity < self.min_liquidity:
-            return None
 
         prices = [p for p in (_to_float(x) for x in _parse_json_list(raw.get("outcomePrices"))) if p is not None]
 
@@ -193,6 +191,7 @@ class GammaClient:
             slug=raw.get("slug", ""),
             group_item_title=raw.get("groupItemTitle", "") or "",
             condition_id=raw.get("conditionId", "") or "",
+            neg_risk_market_id=raw.get("negRiskMarketID", "") or "",
             outcomes=outcomes,
             clob_token_ids=token_ids,
             outcome_prices=prices,

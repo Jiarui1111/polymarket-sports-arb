@@ -47,31 +47,50 @@ class MultiOutcomeArbitrage:
     def scan_event(self, event: Event, get_book: BookGetter) -> List[TradePlan]:
         plans: List[TradePlan] = []
 
-        # Optional legacy strategy: a single binary market YES+NO complement.
         if self.cfg.enable_complement_strategy:
             for market in event.markets:
                 plan = self._complement(event, market, get_book)
                 if plan:
                     plans.append(plan)
 
-        # 策略 2 & 3：仅对 neg-risk（互斥多结果）事件
         if event.neg_risk and len(event.markets) >= 2:
-            if self.cfg.enable_yes_complete_set:
-                buy_set = self._buy_yes_set(event, get_book)
-                if buy_set:
-                    plans.append(buy_set)
-            if self.cfg.enable_equal_no_basket:
-                sell_set = self._buy_no_set(event, get_book)
-                if sell_set:
-                    plans.append(sell_set)
-            if self.cfg.enable_unequal_no_basket:
-                unequal_no = self._unequal_no_basket(event, get_book)
-                if unequal_no:
-                    plans.append(unequal_no)
+            for grouped_event in self._neg_risk_groups(event):
+                if len(grouped_event.markets) < 2:
+                    continue
+                if self.cfg.enable_yes_complete_set:
+                    buy_set = self._buy_yes_set(grouped_event, get_book)
+                    if buy_set:
+                        plans.append(buy_set)
+                if self.cfg.enable_equal_no_basket:
+                    sell_set = self._buy_no_set(grouped_event, get_book)
+                    if sell_set:
+                        plans.append(sell_set)
+                if self.cfg.enable_unequal_no_basket:
+                    unequal_no = self._unequal_no_basket(grouped_event, get_book)
+                    if unequal_no:
+                        plans.append(unequal_no)
 
         return plans
 
-    # ---------------- 策略 1：补集 ----------------
+    def _neg_risk_groups(self, event: Event) -> List[Event]:
+        groups: Dict[str, List[Market]] = {}
+        for market in event.markets:
+            key = market.neg_risk_market_id or "__event__"
+            groups.setdefault(key, []).append(market)
+        if len(groups) <= 1:
+            return [event]
+        return [
+            Event(
+                event_id=event.event_id,
+                title=event.title,
+                slug=event.slug,
+                neg_risk=event.neg_risk,
+                tags=list(event.tags),
+                markets=markets,
+            )
+            for markets in groups.values()
+        ]
+
     def _complement(self, event: Event, market: Market, get_book: BookGetter) -> Optional[TradePlan]:
         yes_tid, no_tid = market.yes_token_id, market.no_token_id
         if not yes_tid or not no_tid:
