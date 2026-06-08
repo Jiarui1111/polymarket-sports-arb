@@ -68,7 +68,8 @@ class App:
     def discover(self) -> None:
         tags = self.args.tags if self.args.tags else self.cfg.market_tags
         discovered = self.gamma.fetch_events(max_events=self.cfg.max_events, tags=tags or None)
-        self.events = self._filter_target_events(discovered)
+        filtered = self._filter_target_events(discovered)
+        self.events = self._hydrate_target_events(filtered)
 
         multi = sum(1 for e in self.events if e.neg_risk and len(e.markets) >= 2)
         logger.info(
@@ -81,6 +82,43 @@ class App:
         token_ids = self._all_tokens()
         self.ws.set_assets(token_ids)
         logger.info("已向 WS 订阅 %d 个 token 的实时订单簿", len(token_ids))
+
+    def _hydrate_target_events(self, events: List[Event]) -> List[Event]:
+        hydrated: List[Event] = []
+        upgraded = 0
+        downgraded = 0
+        for event in events:
+            detail = self.gamma.fetch_event_detail(event.event_id)
+            if detail and len(detail.markets) >= len(event.markets):
+                if len(detail.markets) > len(event.markets):
+                    upgraded += 1
+                    logger.info(
+                        "Hydrated event detail event_id=%s markets=%d->%d title=%s",
+                        event.event_id,
+                        len(event.markets),
+                        len(detail.markets),
+                        event.title,
+                    )
+                hydrated.append(detail)
+            else:
+                if detail:
+                    downgraded += 1
+                    logger.warning(
+                        "Keep list event because detail has fewer markets event_id=%s list=%d detail=%d title=%s",
+                        event.event_id,
+                        len(event.markets),
+                        len(detail.markets),
+                        event.title,
+                    )
+                hydrated.append(event)
+
+        logger.info(
+            "Event detail hydration complete: %d target events, upgraded=%d, detail_fewer=%d",
+            len(events),
+            upgraded,
+            downgraded,
+        )
+        return hydrated
 
     def _filter_target_events(self, events: List[Event]) -> List[Event]:
         if self.args.all_markets or not self.cfg.target_market_filter_enabled:

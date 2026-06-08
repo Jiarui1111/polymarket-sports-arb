@@ -145,6 +145,23 @@ class GammaClient:
         logger.info("Gamma 共发现可用事件 %d 个（含可交易市场）", len(events))
         return events[:max_events]
 
+    def fetch_event_detail(self, event_id: str) -> Optional[Event]:
+        """Fetch the full event detail before scanning.
+
+        Gamma's event list can embed a partial markets array. Complete-set
+        strategies need the full outcome list; otherwise missing outcomes can
+        create false positives.
+        """
+        try:
+            data = self._get(f"/events/{event_id}", {})
+        except Exception as exc:
+            logger.warning("Gamma event detail fetch failed event_id=%s: %s", event_id, exc)
+            return None
+        if not isinstance(data, dict):
+            logger.warning("Gamma event detail returned non-object event_id=%s", event_id)
+            return None
+        return self._parse_event(data, tag_set=None)
+
     def _parse_event(self, raw: dict, tag_set: Optional[set]) -> Optional[Event]:
         tags = self._parse_tags(raw.get("tags"))
         if tag_set is not None:
